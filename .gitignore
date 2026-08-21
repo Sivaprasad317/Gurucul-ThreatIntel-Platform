@@ -46,3 +46,8 @@ frontend/dist/
 # =========================
 .DS_Store
 Thumbs.db
+
+# Backup / temporary files
+*.backup
+*.bak
+*.tmp
