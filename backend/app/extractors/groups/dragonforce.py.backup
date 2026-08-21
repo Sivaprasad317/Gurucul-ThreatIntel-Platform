@@ -1,0 +1,757 @@
+from __future__ import annotations
+
+import json
+import logging
+from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import Any
+from urllib.parse import urlparse
+
+from bs4 import BeautifulSoup
+
+from backend.app.extractors.base import CandidateVictim
+from backend.app.services.normalization import (
+    country_from_address,
+    extract_domain,
+    infer_country_from_domain,
+    infer_industry,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class DragonForceExtractor:
+    """Extract DragonForce victims from HTML/Nuxt and JSON API pages."""
+
+    parser_key = "dragonforce"
+
+    API_PATH = "/api/guest/blog/posts"
+
+    # DragonForce currently exposes approximately 24 records per page.
+    # We don't rely on this number for termination; the API's count and
+    # empty-page behaviour are used instead.
+    MAX_API_PAGES = 100
+
+    def extract(
+        self,
+        html: str,
+        source_page: str,
+    ) -> list[CandidateVictim]:
+        """Extract victims from a DragonForce Nuxt HTML document.
+
+        Parameters
+        ----------
+        html:
+            Raw DragonForce HTML.
+        source_page:
+            URL associated with the crawl.
+
+        Returns
+        -------
+        list[CandidateVictim]
+            Extracted victims.
+
+        Raises
+        ------
+        ValueError
+            If the Nuxt payload cannot be located or decoded.
+        """
+        soup = BeautifulSoup(
+            html,
+            "html.parser",
+        )
+
+        scripts = soup.find_all(
+            "script",
+            attrs={"type": "application/json"},
+        )
+
+        if not scripts:
+            raise ValueError(
+                "DragonForce application/json payload was not found."
+            )
+
+        payload_script = max(
+            scripts,
+            key=lambda script: len(
+                script.get_text()
+            ),
+        )
+
+        payload_text = payload_script.get_text().strip()
+
+        if not payload_text:
+            raise ValueError(
+                "DragonForce application/json payload is empty."
+            )
+
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "DragonForce payload is not valid JSON."
+            ) from exc
+
+        if not isinstance(payload, list):
+            raise ValueError(
+                "DragonForce Nuxt payload root must be a list."
+            )
+
+        logger.info(
+            "DragonForce Nuxt payload entries: %d",
+            len(payload),
+        )
+
+        victims = self._extract_records(
+            payload,
+            source_page,
+        )
+
+        logger.info(
+            "DragonForce HTML extraction found %d victims",
+            len(victims),
+        )
+
+        return victims
+
+    # ------------------------------------------------------------------
+    # API PAGINATION
+    # ------------------------------------------------------------------
+
+    def extract_api_pages(
+        self,
+        *,
+        fetch_page: Callable[[str], dict[str, Any]],
+        source_page: str,
+    ) -> tuple[list[CandidateVictim], int]:
+        """Fetch all DragonForce API pages.
+
+        DragonForce does not expose the blog pagination as ordinary
+        HTML links. The frontend calls:
+
+            /api/guest/blog/posts?page=N
+
+        The API response has this structure:
+
+            {
+                "data": {
+                    "count": 610,
+                    "publications": [...]
+                }
+            }
+
+        Parameters
+        ----------
+        fetch_page:
+            Callback supplied by CrawlService. It performs the actual
+            HTTP/Tor request and returns decoded JSON.
+        source_page:
+            Original DragonForce source URL.
+
+        Returns
+        -------
+        tuple[list[CandidateVictim], int]
+            All extracted victims and number of API pages processed.
+
+        Raises
+        ------
+        ValueError
+            If the API response has an unexpected structure.
+        RuntimeError
+            If API pagination exceeds the safety limit.
+        """
+        api_url = self._build_api_url(source_page)
+
+        candidates: list[CandidateVictim] = []
+
+        seen: set[str] = set()
+
+        total_expected: int | None = None
+
+        pages_processed = 0
+
+        for page in range(
+            1,
+            self.MAX_API_PAGES + 1,
+        ):
+            page_url = f"{api_url}?page={page}"
+
+            logger.info(
+                "DragonForce API page %d: %s",
+                page,
+                page_url,
+            )
+
+            payload = fetch_page(page_url)
+
+            data = payload.get("data")
+
+            if not isinstance(data, dict):
+                raise ValueError(
+                    "DragonForce API response is missing "
+                    "the 'data' object."
+                )
+
+            if total_expected is None:
+                raw_count = data.get("count")
+
+                if isinstance(raw_count, int):
+                    total_expected = raw_count
+
+                    logger.info(
+                        "DragonForce API reports %d total publications",
+                        total_expected,
+                    )
+
+            publications = data.get(
+                "publications"
+            )
+
+            if not isinstance(
+                publications,
+                list,
+            ):
+                raise ValueError(
+                    "DragonForce API response is missing "
+                    "the 'publications' list."
+                )
+
+            pages_processed += 1
+
+            if not publications:
+                logger.info(
+                    "DragonForce API returned an empty page: %d",
+                    page,
+                )
+                break
+
+            page_candidates = 0
+
+            for publication in publications:
+                if not isinstance(
+                    publication,
+                    dict,
+                ):
+                    continue
+
+                candidate = self._build_api_candidate(
+                    publication,
+                    source_page,
+                )
+
+                if candidate is None:
+                    continue
+
+                key = candidate.name.casefold()
+
+                if key in seen:
+                    continue
+
+                seen.add(key)
+
+                candidates.append(candidate)
+
+                page_candidates += 1
+
+            logger.info(
+                "DragonForce API page %d complete: "
+                "publications=%d candidates=%d total=%d",
+                page,
+                len(publications),
+                page_candidates,
+                len(candidates),
+            )
+
+            # The API tells us exactly how many records exist.
+            if (
+                total_expected is not None
+                and len(candidates) >= total_expected
+            ):
+                logger.info(
+                    "DragonForce API pagination complete: "
+                    "collected=%d expected=%d pages=%d",
+                    len(candidates),
+                    total_expected,
+                    pages_processed,
+                )
+                break
+
+            # If a page contains fewer records than the usual page
+            # size, it is normally the final page.
+            #
+            # We intentionally do not hard-code 24 here. A future
+            # server-side page-size change should not break collection.
+            if (
+                total_expected is not None
+                and len(candidates) >= total_expected
+            ):
+                break
+
+        else:
+            raise RuntimeError(
+                "DragonForce API pagination exceeded "
+                f"the safety limit of {self.MAX_API_PAGES} pages."
+            )
+
+        logger.info(
+            "DragonForce API extraction complete: "
+            "pages=%d victims=%d expected=%s",
+            pages_processed,
+            len(candidates),
+            total_expected,
+        )
+
+        return candidates, pages_processed
+
+    @classmethod
+    def _build_api_url(
+        cls,
+        source_page: str,
+    ) -> str:
+        """Build DragonForce's guest blog API URL.
+
+        Parameters
+        ----------
+        source_page:
+            DragonForce blog URL.
+
+        Returns
+        -------
+        str
+            API endpoint URL.
+        """
+        parsed = urlparse(
+            source_page
+        )
+
+        if not parsed.scheme or not parsed.netloc:
+            raise ValueError(
+                f"Invalid DragonForce source URL: {source_page}"
+            )
+
+        return (
+            f"{parsed.scheme}://"
+            f"{parsed.netloc}"
+            f"{cls.API_PATH}"
+        )
+
+    def _build_api_candidate(
+        self,
+        value: dict[str, Any],
+        source_page: str,
+    ) -> CandidateVictim | None:
+        """Convert one DragonForce API publication to a victim.
+
+        Parameters
+        ----------
+        value:
+            Publication dictionary returned by the API.
+        source_page:
+            Original source page.
+
+        Returns
+        -------
+        CandidateVictim | None
+            Normalized victim candidate.
+        """
+        name = self._clean(
+            value.get("name")
+        )
+
+        if not name:
+            return None
+
+        website = self._clean(
+            value.get("website")
+        )
+
+        address = self._clean(
+            value.get("address")
+        )
+
+        description = self._clean(
+            value.get("description")
+        )
+
+        published_on = self._parse_datetime(
+            value.get("created_at")
+        )
+
+        # --------------------------------------------------------------
+        # Country
+        #
+        # Priority:
+        #
+        # 1. Explicit address
+        # 2. Website country-code TLD
+        #
+        # This is important for:
+        #
+        #     Vermont XCenter
+        #     address = vermont.com.br
+        #
+        # The address is intentionally rejected as a domain by
+        # country_from_address(), allowing .com.br -> Brazil.
+        # --------------------------------------------------------------
+
+        country = country_from_address(
+            address
+        )
+
+        if country is None:
+            domain = extract_domain(
+                website
+            )
+
+            country_code, _, _ = (
+                infer_country_from_domain(
+                    domain
+                )
+            )
+
+            country = country_code
+
+        # --------------------------------------------------------------
+        # Industry
+        # --------------------------------------------------------------
+
+        industry_text = " ".join(
+            part
+            for part in (
+                name,
+                description,
+                address,
+            )
+            if part
+        )
+
+        _, industry_name, _ = infer_industry(
+            industry_text
+        )
+
+        return CandidateVictim(
+            name=name,
+            source_page=source_page,
+            country=country,
+            industry=industry_name,
+            website=website,
+            description=self._build_description(
+                description=description,
+                website=website,
+                address=address,
+            ),
+            published_on=published_on,
+            discovered_on=published_on,
+        )
+
+    # ------------------------------------------------------------------
+    # NUXT PAYLOAD EXTRACTION
+    # ------------------------------------------------------------------
+
+    def _extract_records(
+        self,
+        payload: list[Any],
+        source_page: str,
+    ) -> list[CandidateVictim]:
+        """Find victim dictionaries inside the Nuxt payload."""
+        result: list[CandidateVictim] = []
+
+        seen: set[str] = set()
+
+        for index, value in enumerate(payload):
+            if not isinstance(
+                value,
+                dict,
+            ):
+                continue
+
+            if not self._looks_like_victim(
+                value
+            ):
+                continue
+
+            record = self._resolve_record(
+                value,
+                payload,
+            )
+
+            if not record:
+                continue
+
+            candidate = self._build_candidate(
+                record,
+                source_page,
+            )
+
+            if candidate is None:
+                continue
+
+            key = candidate.name.casefold()
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+
+            result.append(candidate)
+
+            logger.debug(
+                "DragonForce victim %d: %s",
+                index,
+                candidate.name,
+            )
+
+        return result
+
+    def _resolve_record(
+        self,
+        value: dict[str, Any],
+        payload: list[Any],
+    ) -> dict[str, Any] | None:
+        """Resolve fields belonging to one Nuxt victim record."""
+        result: dict[str, Any] = {}
+
+        fields = (
+            "uuid",
+            "created_at",
+            "name",
+            "website",
+            "address",
+            "description",
+        )
+
+        for field in fields:
+            if field not in value:
+                continue
+
+            result[field] = self._resolve_reference(
+                value[field],
+                payload,
+            )
+
+        if not self._looks_like_victim(
+            result
+        ):
+            return None
+
+        return result
+
+    @classmethod
+    def _resolve_reference(
+        cls,
+        value: Any,
+        payload: list[Any],
+    ) -> Any:
+        """Resolve a Nuxt root-payload reference."""
+        if not isinstance(
+            value,
+            int,
+        ):
+            return value
+
+        if value < 0 or value >= len(payload):
+            return None
+
+        resolved = payload[value]
+
+        if isinstance(
+            resolved,
+            str,
+        ):
+            return resolved
+
+        if (
+            isinstance(
+                resolved,
+                list,
+            )
+            and len(resolved) == 2
+            and isinstance(
+                resolved[1],
+                int,
+            )
+        ):
+            return cls._resolve_reference(
+                resolved[1],
+                payload,
+            )
+
+        return resolved
+
+    def _build_candidate(
+        self,
+        value: dict[str, Any],
+        source_page: str,
+    ) -> CandidateVictim | None:
+        """Convert a Nuxt record into CandidateVictim."""
+        name = self._clean(
+            value.get("name")
+        )
+
+        if not name:
+            return None
+
+        website = self._clean(
+            value.get("website")
+        )
+
+        address = self._clean(
+            value.get("address")
+        )
+
+        description = self._clean(
+            value.get("description")
+        )
+
+        published_on = self._parse_datetime(
+            value.get("created_at")
+        )
+
+        country = country_from_address(
+            address
+        )
+
+        if country is None:
+            domain = extract_domain(
+                website
+            )
+
+            country_code, _, _ = (
+                infer_country_from_domain(
+                    domain
+                )
+            )
+
+            country = country_code
+
+        industry_text = " ".join(
+            part
+            for part in (
+                name,
+                description,
+                address,
+            )
+            if part
+        )
+
+        _, industry_name, _ = infer_industry(
+            industry_text
+        )
+
+        return CandidateVictim(
+            name=name,
+            source_page=source_page,
+            country=country,
+            industry=industry_name,
+            website=website,
+            description=self._build_description(
+                description=description,
+                website=website,
+                address=address,
+            ),
+            published_on=published_on,
+            discovered_on=published_on,
+        )
+
+    @staticmethod
+    def _looks_like_victim(
+        value: dict[str, Any],
+    ) -> bool:
+        """Check whether a dictionary resembles a victim record."""
+        required_fields = {
+            "uuid",
+            "created_at",
+            "name",
+            "website",
+            "address",
+            "description",
+        }
+
+        return required_fields.issubset(
+            value
+        )
+
+    @staticmethod
+    def _clean(
+        value: Any,
+    ) -> str | None:
+        """Normalize a value into a string."""
+        if value is None:
+            return None
+
+        if not isinstance(
+            value,
+            str,
+        ):
+            return None
+
+        text = value.strip()
+
+        return text or None
+
+    @staticmethod
+    def _parse_datetime(
+        value: Any,
+    ) -> datetime | None:
+        """Parse DragonForce ISO timestamp."""
+        if not isinstance(
+            value,
+            str,
+        ):
+            return None
+
+        text = value.strip()
+
+        if not text:
+            return None
+
+        try:
+            result = datetime.fromisoformat(
+                text.replace(
+                    "Z",
+                    "+00:00",
+                )
+            )
+        except ValueError:
+            logger.warning(
+                "Unable to parse DragonForce timestamp: %r",
+                value,
+            )
+            return None
+
+        if result.tzinfo is None:
+            result = result.replace(
+                tzinfo=UTC
+            )
+
+        return result
+
+    @staticmethod
+    def _build_description(
+        *,
+        description: str | None,
+        website: str | None,
+        address: str | None,
+    ) -> str | None:
+        """Build a useful victim description."""
+        parts: list[str] = []
+
+        if description:
+            parts.append(
+                description
+            )
+
+        if website:
+            parts.append(
+                f"Website: {website}"
+            )
+
+        if address:
+            parts.append(
+                f"Address: {address}"
+            )
+
+        return "\n".join(parts) or None
+
+
+EXTRACTOR = DragonForceExtractor()

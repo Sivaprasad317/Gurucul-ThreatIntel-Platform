@@ -1,0 +1,46 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: gurucul_threatintel
+      POSTGRES_USER: gurucul
+      POSTGRES_PASSWORD: change-me
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gurucul -d gurucul_threatintel"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg://gurucul:change-me@postgres:5432/gurucul_threatintel
+      JWT_SECRET: replace-with-a-long-random-secret
+      ADMIN_EMAIL: admin@example.com
+      ADMIN_PASSWORD: ChangeMe123!
+      CORS_ORIGINS: http://localhost:5173
+      DEMO_MODE: "true"
+      SEED_DEMO_DATA: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: sh -c "python scripts/seed_demo.py && python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8001"
+    ports:
+      - "8001:8001"
+
+  frontend:
+    build:
+      context: ./frontend
+    depends_on:
+      - backend
+    ports:
+      - "5173:80"
+
+volumes:
+  postgres_data:

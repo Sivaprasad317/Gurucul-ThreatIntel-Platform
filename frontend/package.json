@@ -1,0 +1,25 @@
+{
+  "name": "gurucul-threatintel-platform",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 5173",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview --port 4173"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^4.6.0",
+    "d3-geo": "^3.1.1",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "topojson-client": "^3.1.0",
+    "typescript": "~5.8.3",
+    "vite": "^7.1.2",
+    "world-atlas": "^2.0.2"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.10",
+    "@types/react-dom": "^19.1.7"
+  }
+}
